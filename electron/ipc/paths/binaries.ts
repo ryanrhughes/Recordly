@@ -125,6 +125,10 @@ export function getCursorMonitorExePath(): string {
 	return resolvePreferredWindowsNativeHelperPath("cursor-monitor", "cursor-monitor.exe");
 }
 
+export function getLinuxCursorTrackerExePath(): string {
+	return getPrebundledNativeHelperPath("recordly-linux-cursor-tracker");
+}
+
 async function migrateLegacyNativeHelperBinaries(): Promise<void> {
 	const legacyToCurrentPaths: Array<[string, string]> = [
 		[
@@ -256,4 +260,20 @@ export async function ensureNativeCursorMonitorBinary(): Promise<string> {
 		"native cursor monitor helper",
 		"recordly-native-cursor-monitor",
 	);
+}
+
+export async function ensureLinuxCursorTrackerBinary(): Promise<string> {
+	if (process.platform !== "linux") {
+		throw new Error("Linux cursor tracker is only available on Linux.");
+	}
+
+	const helperPath = getLinuxCursorTrackerExePath();
+	try {
+		await fs.access(helperPath, fsConstants.X_OK);
+		return helperPath;
+	} catch {
+		throw new Error(
+			`Linux cursor tracker helper is missing from this app build (${helperPath}). Rebuild Recordly with npm run build:linux-cursor-tracker.`,
+		);
+	}
 }

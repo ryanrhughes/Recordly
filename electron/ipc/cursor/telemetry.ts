@@ -175,11 +175,27 @@ export function getNormalizedCursorPoint() {
 	const linuxCursorCache = process.platform === "linux" ? linuxCursorScreenPoint : null;
 	const isLinuxCacheFresh = !!linuxCursorCache && Date.now() - linuxCursorCache.updatedAt <= 1000;
 
+	if (
+		isLinuxCacheFresh &&
+		selectedSource?.id === "screen:linux-portal" &&
+		typeof linuxCursorCache.cx === "number" &&
+		Number.isFinite(linuxCursorCache.cx) &&
+		typeof linuxCursorCache.cy === "number" &&
+		Number.isFinite(linuxCursorCache.cy)
+	) {
+		return {
+			cx: clamp(linuxCursorCache.cx, 0, 1),
+			cy: clamp(linuxCursorCache.cy, 0, 1),
+		};
+	}
+
 	const primarySf =
 		process.platform !== "darwin" ? getScreen().getPrimaryDisplay().scaleFactor || 1 : 1;
 
 	const cursor = isLinuxCacheFresh
-		? { x: linuxCursorCache.x / primarySf, y: linuxCursorCache.y / primarySf }
+		? linuxCursorCache.coordinateSpace === "logical"
+			? { x: linuxCursorCache.x, y: linuxCursorCache.y }
+			: { x: linuxCursorCache.x / primarySf, y: linuxCursorCache.y / primarySf }
 		: fallbackCursor;
 
 	const windowBounds = selectedSource?.id?.startsWith("window:") ? selectedWindowBounds : null;

@@ -17,6 +17,7 @@ import { getMonitorHandles } from "../monitorResolver";
 import { ALLOW_RECORDLY_WINDOW_CAPTURE } from "../constants";
 import { startWindowBoundsCapture, stopWindowBoundsCapture } from "../cursor/bounds";
 import { startInteractionCapture, stopInteractionCapture } from "../cursor/interaction";
+import { startLinuxCursorTracker, stopLinuxCursorTracker } from "../cursor/linuxTracker";
 import { startNativeCursorMonitor, stopNativeCursorMonitor } from "../cursor/monitor";
 import {
 	normalizeCursorTelemetrySamples,
@@ -1823,6 +1824,7 @@ export function registerRecordingHandlers(
 			resetCursorCaptureClock();
 			setLinuxCursorScreenPoint(null);
 			setLastLeftClick(null);
+			void startLinuxCursorTracker();
 			sampleCursorPoint();
 			startCursorSampling();
 			void startInteractionCapture();
@@ -1832,6 +1834,7 @@ export function registerRecordingHandlers(
 			stopInteractionCapture();
 			stopWindowBoundsCapture();
 			stopNativeCursorMonitor();
+			stopLinuxCursorTracker();
 			showCursor();
 			setLinuxCursorScreenPoint(null);
 			resetCursorCaptureClock();

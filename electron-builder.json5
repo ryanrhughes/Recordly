@@ -25,6 +25,7 @@
     "!node_modules/ffprobe-static/bin/linux/**",
     "!node_modules/ffprobe-static/bin/win32/ia32/**",
     "!electron/native/**/build/**",
+    "!electron/native/**/target/**",
     "!*.png",
     "!preview*.png",
     "!*.md",

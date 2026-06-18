@@ -172,8 +172,73 @@ function loadUiohookModule() {
 	}
 }
 
+function isLinuxWaylandSession() {
+	return (
+		process.platform === "linux" &&
+		(Boolean(process.env.WAYLAND_DISPLAY) || process.env.XDG_SESSION_TYPE === "wayland")
+	);
+}
+
+export function recordCursorMouseDown(button: 1 | 2 | 3) {
+	if (!isCursorCaptureActive || isCursorCapturePaused()) {
+		return;
+	}
+
+	const point = getNormalizedCursorPoint();
+	if (!point) {
+		return;
+	}
+
+	const timeMs = getCursorCaptureElapsedMs();
+	let interactionType: CursorInteractionType = "click";
+
+	if (button === 2) {
+		interactionType = "right-click";
+	} else if (button === 3) {
+		interactionType = "middle-click";
+	} else {
+		const thresholdMs = 350;
+		const distance = lastLeftClick
+			? Math.hypot(point.cx - lastLeftClick.cx, point.cy - lastLeftClick.cy)
+			: Number.POSITIVE_INFINITY;
+
+		if (
+			lastLeftClick &&
+			timeMs - lastLeftClick.timeMs <= thresholdMs &&
+			distance <= 0.04
+		) {
+			interactionType = "double-click";
+		}
+
+		setLastLeftClick({ timeMs, cx: point.cx, cy: point.cy });
+	}
+
+	pushCursorSample(point.cx, point.cy, timeMs, interactionType);
+}
+
+export function recordCursorMouseUp() {
+	if (!isCursorCaptureActive || isCursorCapturePaused()) {
+		return;
+	}
+
+	const point = getNormalizedCursorPoint();
+	if (!point) {
+		return;
+	}
+
+	const timeMs = getCursorCaptureElapsedMs();
+	pushCursorSample(point.cx, point.cy, timeMs, "mouseup");
+}
+
 export async function startInteractionCapture() {
 	if (!isCursorCaptureActive) {
+		return;
+	}
+
+	// On native Linux/Wayland the dedicated linux cursor tracker owns both
+	// position and button telemetry. uiohook-napi is X11/XWayland-oriented here
+	// and can overwrite exact Hyprland cursorpos samples with stale coordinates.
+	if (isLinuxWaylandSession()) {
 		return;
 	}
 
@@ -203,55 +268,11 @@ export async function startInteractionCapture() {
 		}
 
 		const onMouseDown = (event: HookMouseEvent) => {
-			if (!isCursorCaptureActive || isCursorCapturePaused()) {
-				return;
-			}
-
-			const point = getNormalizedCursorPoint();
-			if (!point) {
-				return;
-			}
-
-			const timeMs = getCursorCaptureElapsedMs();
-			const button = getHookMouseButton(event);
-			let interactionType: CursorInteractionType = "click";
-
-			if (button === 2) {
-				interactionType = "right-click";
-			} else if (button === 3) {
-				interactionType = "middle-click";
-			} else {
-				const thresholdMs = 350;
-				const distance = lastLeftClick
-					? Math.hypot(point.cx - lastLeftClick.cx, point.cy - lastLeftClick.cy)
-					: Number.POSITIVE_INFINITY;
-
-				if (
-					lastLeftClick &&
-					timeMs - lastLeftClick.timeMs <= thresholdMs &&
-					distance <= 0.04
-				) {
-					interactionType = "double-click";
-				}
-
-				setLastLeftClick({ timeMs, cx: point.cx, cy: point.cy });
-			}
-
-			pushCursorSample(point.cx, point.cy, timeMs, interactionType);
+			recordCursorMouseDown(getHookMouseButton(event));
 		};
 
 		const onMouseUp = () => {
-			if (!isCursorCaptureActive || isCursorCapturePaused()) {
-				return;
-			}
-
-			const point = getNormalizedCursorPoint();
-			if (!point) {
-				return;
-			}
-
-			const timeMs = getCursorCaptureElapsedMs();
-			pushCursorSample(point.cx, point.cy, timeMs, "mouseup");
+			recordCursorMouseUp();
 		};
 
 		const onMouseMove = (event: HookMouseEvent) => {
