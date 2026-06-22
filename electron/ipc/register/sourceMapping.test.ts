@@ -6,14 +6,26 @@ import {
 } from "./sourceMapping";
 
 describe("getScreenSourceIdForDisplay", () => {
-	it("keeps the live Electron screen source when one is available", () => {
+	it("keeps the live Electron screen source on Linux X11 when one is available", () => {
 		expect(
 			getScreenSourceIdForDisplay({
 				displayId: "42",
+				env: { XDG_SESSION_TYPE: "x11", DISPLAY: ":0" },
 				matchedSourceId: "screen:42:0",
 				platform: "linux",
 			}),
 		).toBe("screen:42:0");
+	});
+
+	it("routes matched Linux Wayland screens through the portal sentinel", () => {
+		expect(
+			getScreenSourceIdForDisplay({
+				displayId: "42",
+				env: { XDG_SESSION_TYPE: "wayland", WAYLAND_DISPLAY: "wayland-0" },
+				matchedSourceId: "screen:42:0",
+				platform: "linux",
+			}),
+		).toBe(LINUX_PORTAL_SCREEN_SOURCE_ID);
 	});
 
 	it("routes unmatched Linux Wayland screens through the portal sentinel", () => {

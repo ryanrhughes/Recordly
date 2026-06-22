@@ -9,6 +9,14 @@ const STARTUP_STABILIZATION_SECONDS = 1.25;
 const STARTUP_MAX_DECODE_QUEUE = 12;
 const STARTUP_MAX_PENDING_FRAMES = 28;
 
+function isLinuxRuntime(): boolean {
+	if (typeof navigator === "undefined") {
+		return false;
+	}
+
+	return /linux/i.test(`${navigator.platform || ""} ${navigator.userAgent || ""}`);
+}
+
 export interface DecodedVideoInfo {
 	width: number;
 	height: number;
@@ -204,7 +212,8 @@ export class StreamingVideoDecoder {
 
 		const decoderConfig = await this.demuxer.getDecoderConfig("video");
 		const codec = this.metadata.codec.toLowerCase();
-		const shouldPreferSoftwareDecode = codec.includes("av01") || codec.includes("av1");
+		const shouldPreferSoftwareDecode =
+			isLinuxRuntime() || codec.includes("av01") || codec.includes("av1");
 		const effectiveVideoDuration = getEffectiveVideoStreamDurationSeconds({
 			duration: this.metadata.duration,
 			streamDuration: this.metadata.streamDuration,

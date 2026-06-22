@@ -1,4 +1,13 @@
-import { Application, BlurFilter, Container, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
+import {
+	Application,
+	BlurFilter,
+	BufferImageSource,
+	Container,
+	Graphics,
+	Rectangle,
+	Sprite,
+	Texture,
+} from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
 import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
 import { buildActiveCaptionLayout } from "@/components/video-editor/captionLayout";
@@ -99,6 +108,7 @@ import {
 import { buildTemporalSamplePlanUs, getTemporalMotionBlurConfig } from "./temporalMotionBlur";
 
 const TEMPORAL_ZOOM_MOTION_BLUR_ENABLED = false;
+const RGBA_BYTES_PER_PIXEL = 4;
 
 import type { ExportRenderBackend } from "./types";
 
@@ -189,9 +199,18 @@ interface LayoutCache {
 }
 
 interface MutableVideoTextureSource {
-	resource: CanvasImageSource | VideoFrame;
+	resource: CanvasImageSource | VideoFrame | Uint8Array | ArrayBuffer;
 	update: () => void;
 }
+
+interface VideoFrameBufferStaging {
+	source: BufferImageSource;
+	pixels: Uint8Array;
+	width: number;
+	height: number;
+}
+
+type VideoTextureInput = CanvasImageSource | VideoFrame | BufferImageSource;
 
 interface ShadowLayer {
 	container: Container;
@@ -205,7 +224,7 @@ interface ShadowLayer {
 }
 
 interface WebcamRenderSource {
-	source: CanvasImageSource | VideoFrame;
+	source: VideoTextureInput;
 	width: number;
 	height: number;
 	mode: "live" | "cached";
@@ -451,6 +470,9 @@ export class FrameRenderer {
 	private backgroundVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
 	private webcamVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
 	private webcamVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
+	private sceneVideoFrameBufferStaging: VideoFrameBufferStaging | null = null;
+	private backgroundVideoFrameBufferStaging: VideoFrameBufferStaging | null = null;
+	private webcamVideoFrameBufferStaging: VideoFrameBufferStaging | null = null;
 	private captionMeasureCanvas: HTMLCanvasElement | null = null;
 	private captionMeasureCtx: CanvasRenderingContext2D | null = null;
 	private captionCanvas: HTMLCanvasElement | null = null;
@@ -501,6 +523,7 @@ export class FrameRenderer {
 	private retainedSceneBitmap: ImageBitmap | null = null;
 	private retainedBackgroundBitmapTimestamp: number | null = null;
 	private retainedBackgroundBitmap: ImageBitmap | null = null;
+	private videoFrameCopyToStagingFailed = false;
 	private compositeCanvas: HTMLCanvasElement | null = null;
 	private compositeCtx: CanvasRenderingContext2D | null = null;
 	private lastEmittedClickTimeMs = -1;
@@ -942,9 +965,11 @@ export class FrameRenderer {
 		kind: "scene" | "background",
 		fallbackWidth: number,
 		fallbackHeight: number,
-	): Promise<CanvasImageSource | VideoFrame> {
+	): Promise<VideoTextureInput> {
 		if (this.rendererBackend !== "webgpu" || typeof createImageBitmap !== "function") {
-			return this.stageVideoFrameForTexture(frame, kind, fallbackWidth, fallbackHeight);
+			return this.isLinuxRuntime()
+				? this.stageVideoFrameOnBufferWithCopyTo(frame, kind, fallbackWidth, fallbackHeight)
+				: this.stageVideoFrameOnCanvasWithCopyTo(frame, kind, fallbackWidth, fallbackHeight);
 		}
 
 		const cachedTimestamp =
@@ -982,7 +1007,7 @@ export class FrameRenderer {
 		kind: "scene" | "background" | "webcam",
 		fallbackWidth: number,
 		fallbackHeight: number,
-	): CanvasImageSource | VideoFrame {
+	): VideoTextureInput {
 		if (this.rendererBackend !== "webgpu") {
 			return frame;
 		}
@@ -1061,12 +1086,92 @@ export class FrameRenderer {
 		return { canvas, context };
 	}
 
+	private isLinuxRuntime(): boolean {
+		if (typeof navigator === "undefined") {
+			return false;
+		}
+
+		return /linux/i.test(`${navigator.platform || ""} ${navigator.userAgent || ""}`);
+	}
+
+	private ensureVideoFrameBufferStaging(
+		kind: "scene" | "background" | "webcam",
+		width: number,
+		height: number,
+	): VideoFrameBufferStaging {
+		const targetWidth = Math.max(1, Math.ceil(width));
+		const targetHeight = Math.max(1, Math.ceil(height));
+		const current =
+			kind === "scene"
+				? this.sceneVideoFrameBufferStaging
+				: kind === "background"
+					? this.backgroundVideoFrameBufferStaging
+					: this.webcamVideoFrameBufferStaging;
+
+		if (current && current.width === targetWidth && current.height === targetHeight) {
+			return current;
+		}
+
+		const pixels = new Uint8Array(targetWidth * targetHeight * RGBA_BYTES_PER_PIXEL);
+		const source = new BufferImageSource({
+			resource: pixels,
+			width: targetWidth,
+			height: targetHeight,
+			format: "rgba8unorm",
+			alphaMode: "no-premultiply-alpha",
+		});
+		const staging = { source, pixels, width: targetWidth, height: targetHeight };
+
+		if (kind === "scene") {
+			this.sceneVideoFrameBufferStaging = staging;
+		} else if (kind === "background") {
+			this.backgroundVideoFrameBufferStaging = staging;
+		} else {
+			this.webcamVideoFrameBufferStaging = staging;
+		}
+
+		return staging;
+	}
+
+	private async stageVideoFrameOnBufferWithCopyTo(
+		frame: VideoFrame,
+		kind: "scene" | "background" | "webcam",
+		fallbackWidth: number,
+		fallbackHeight: number,
+	): Promise<VideoTextureInput> {
+		if (typeof frame.copyTo !== "function") {
+			return this.stageVideoFrameOnCanvas(frame, kind, fallbackWidth, fallbackHeight);
+		}
+
+		const width = Math.max(1, frame.displayWidth || fallbackWidth);
+		const height = Math.max(1, frame.displayHeight || fallbackHeight);
+		const staging = this.ensureVideoFrameBufferStaging(kind, width, height);
+
+		try {
+			await frame.copyTo(staging.pixels, {
+				format: "RGBA",
+				layout: [{ offset: 0, stride: staging.width * RGBA_BYTES_PER_PIXEL }],
+			});
+			staging.source.update();
+			return staging.source;
+		} catch (error) {
+			if (!this.videoFrameCopyToStagingFailed) {
+				this.videoFrameCopyToStagingFailed = true;
+				console.warn(
+					"[ModernFrameRenderer] VideoFrame RGBA copyTo buffer upload staging failed; falling back to canvas drawImage staging.",
+					error,
+				);
+			}
+			return this.stageVideoFrameOnCanvas(frame, kind, fallbackWidth, fallbackHeight);
+		}
+	}
+
 	private stageVideoFrameOnCanvas(
 		frame: VideoFrame,
 		kind: "scene" | "background" | "webcam",
 		fallbackWidth: number,
 		fallbackHeight: number,
-	): CanvasImageSource | VideoFrame {
+	): VideoTextureInput {
 		const width = Math.max(1, frame.displayWidth || fallbackWidth);
 		const height = Math.max(1, frame.displayHeight || fallbackHeight);
 		const staging = this.ensureVideoFrameStagingCanvas(kind, width, height);
@@ -1079,12 +1184,48 @@ export class FrameRenderer {
 		return staging.canvas;
 	}
 
+	private async stageVideoFrameOnCanvasWithCopyTo(
+		frame: VideoFrame,
+		kind: "scene" | "background" | "webcam",
+		fallbackWidth: number,
+		fallbackHeight: number,
+	): Promise<VideoTextureInput> {
+		const width = Math.max(1, frame.displayWidth || fallbackWidth);
+		const height = Math.max(1, frame.displayHeight || fallbackHeight);
+		const staging = this.ensureVideoFrameStagingCanvas(kind, width, height);
+		if (!staging) {
+			return frame;
+		}
+
+		if (typeof frame.copyTo === "function" && typeof ImageData !== "undefined") {
+			try {
+				const rgba = new Uint8ClampedArray(width * height * RGBA_BYTES_PER_PIXEL);
+				await frame.copyTo(rgba, {
+					format: "RGBA",
+					layout: [{ offset: 0, stride: width * RGBA_BYTES_PER_PIXEL }],
+				});
+				staging.context.putImageData(new ImageData(rgba, width, height), 0, 0);
+				return staging.canvas;
+			} catch (error) {
+				if (!this.videoFrameCopyToStagingFailed) {
+					this.videoFrameCopyToStagingFailed = true;
+					console.warn(
+						"[ModernFrameRenderer] VideoFrame RGBA copyTo staging failed; falling back to canvas drawImage staging.",
+						error,
+					);
+				}
+			}
+		}
+
+		return this.stageVideoFrameOnCanvas(frame, kind, fallbackWidth, fallbackHeight);
+	}
+
 	private stageVideoFrameForTexture(
 		frame: VideoFrame,
 		kind: "scene" | "background" | "webcam",
 		fallbackWidth: number,
 		fallbackHeight: number,
-	): CanvasImageSource | VideoFrame {
+	): VideoTextureInput {
 		// Keep webcam uploads on the older canvas-staged path. The newer
 		// retained-VideoFrame upload path is fine for the main scene/background,
 		// but it has produced unstable webcam overlays in Lightning exports.
@@ -1099,9 +1240,30 @@ export class FrameRenderer {
 		return this.stageVideoFrameOnCanvas(frame, kind, fallbackWidth, fallbackHeight);
 	}
 
+	private updateMutableTextureSource(
+		currentSource: MutableVideoTextureSource,
+		nextSource: VideoTextureInput,
+	): boolean {
+		if (nextSource instanceof BufferImageSource) {
+			if (currentSource === (nextSource as unknown as MutableVideoTextureSource)) {
+				currentSource.update();
+				return true;
+			}
+			return false;
+		}
+
+		if (currentSource instanceof BufferImageSource) {
+			return false;
+		}
+
+		currentSource.resource = nextSource;
+		currentSource.update();
+		return true;
+	}
+
 	private replaceSpriteTexture(
 		sprite: Sprite,
-		source: CanvasImageSource | VideoFrame,
+		source: VideoTextureInput,
 	): MutableVideoTextureSource {
 		const nextTexture = this.createTextureFromSource(source);
 		const previousTexture = sprite.texture;
@@ -1110,7 +1272,11 @@ export class FrameRenderer {
 		return nextTexture.source as unknown as MutableVideoTextureSource;
 	}
 
-	private createTextureFromSource(source: CanvasImageSource | VideoFrame): Texture {
+	private createTextureFromSource(source: VideoTextureInput): Texture {
+		if (source instanceof BufferImageSource) {
+			return new Texture({ source });
+		}
+
 		if (typeof VideoFrame !== "undefined" && source instanceof VideoFrame) {
 			return Texture.from(source as unknown as ImageBitmap);
 		}
@@ -1342,7 +1508,7 @@ export class FrameRenderer {
 	}
 
 	private async ensureBackgroundSprite(
-		source: CanvasImageSource | VideoFrame,
+		source: VideoTextureInput,
 		sourceWidth: number,
 		sourceHeight: number,
 	): Promise<void> {
@@ -1401,9 +1567,14 @@ export class FrameRenderer {
 				this.backgroundBlurFilter.resolution = this.app?.renderer.resolution ?? 1;
 				this.backgroundSprite.filters = [this.backgroundBlurFilter];
 			}
-		} else if (this.backgroundTextureSource) {
-			this.backgroundTextureSource.resource = resolvedSource;
-			this.backgroundTextureSource.update();
+		} else if (
+			this.backgroundTextureSource &&
+			!this.updateMutableTextureSource(this.backgroundTextureSource, resolvedSource)
+		) {
+			this.backgroundTextureSource = this.replaceSpriteTexture(
+				this.backgroundSprite,
+				resolvedSource,
+			);
 		}
 
 		applyCoverLayoutToSprite(
@@ -1922,7 +2093,7 @@ export class FrameRenderer {
 					this.backgroundDecodedFrame = restartedFrame;
 					if (restartedFrame) {
 						this.lastSyncedBackgroundLoopTimeSec = normalizedTargetTime;
-						const resolvedBackgroundSource = this.stageVideoFrameForTexture(
+						const resolvedBackgroundSource = await this.resolveDetachedVideoFrameSource(
 							restartedFrame,
 							"background",
 							restartedFrame.displayWidth,
@@ -1950,7 +2121,7 @@ export class FrameRenderer {
 			this.backgroundDecodedFrame = decodedFrame;
 			if (decodedFrame) {
 				this.lastSyncedBackgroundLoopTimeSec = normalizedTargetTime;
-				const resolvedBackgroundSource = this.stageVideoFrameForTexture(
+				const resolvedBackgroundSource = await this.resolveDetachedVideoFrameSource(
 					decodedFrame,
 					"background",
 					decodedFrame.displayWidth,
@@ -2433,7 +2604,7 @@ export class FrameRenderer {
 	}
 
 	private ensureWebcamSprite(
-		source: CanvasImageSource | VideoFrame,
+		source: VideoTextureInput,
 		sourceWidth: number,
 		sourceHeight: number,
 	): void {
@@ -2456,9 +2627,11 @@ export class FrameRenderer {
 		} else if (this.webcamTextureUsesStartupStaging !== usesStartupStaging) {
 			this.webcamTextureSource = this.replaceSpriteTexture(this.webcamSprite, resolvedSource);
 			this.webcamTextureUsesStartupStaging = usesStartupStaging;
-		} else if (this.webcamTextureSource) {
-			this.webcamTextureSource.resource = resolvedSource;
-			this.webcamTextureSource.update();
+		} else if (
+			this.webcamTextureSource &&
+			!this.updateMutableTextureSource(this.webcamTextureSource, resolvedSource)
+		) {
+			this.webcamTextureSource = this.replaceSpriteTexture(this.webcamSprite, resolvedSource);
 		}
 
 		if (this.webcamRootContainer) {
@@ -3205,9 +3378,14 @@ export class FrameRenderer {
 				resolvedVideoSource,
 			);
 			this.videoTextureUsesStartupStaging = usesStartupStaging;
-		} else if (this.videoTextureSource) {
-			this.videoTextureSource.resource = resolvedVideoSource;
-			this.videoTextureSource.update();
+		} else if (
+			this.videoTextureSource &&
+			!this.updateMutableTextureSource(this.videoTextureSource, resolvedVideoSource)
+		) {
+			this.videoTextureSource = this.replaceSpriteTexture(
+				this.videoSprite,
+				resolvedVideoSource,
+			);
 		}
 
 		if (!this.layoutCache) {

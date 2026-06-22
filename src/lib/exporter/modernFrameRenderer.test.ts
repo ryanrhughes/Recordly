@@ -18,34 +18,58 @@ const {
 	})),
 }));
 
-vi.mock("pixi.js", () => ({
-	Application: class {},
-	BlurFilter: class {},
-	Container: class {
-		visible = true;
-		addChild = vi.fn();
-		addChildAt = vi.fn();
-		removeChildren = vi.fn();
-	},
-	Graphics: class {},
-	Sprite: class {
-		visible = true;
-		x = 0;
-		y = 0;
-		alpha = 1;
-		scale = { x: 1, y: 1, set: vi.fn() };
-		anchor = { x: 0.5, y: 0.5, set: vi.fn() };
-		position = { set: vi.fn() };
-		texture: { destroy: ReturnType<typeof vi.fn> };
+vi.mock("pixi.js", () => {
+	class MockBufferImageSource {
+		resource: unknown;
+		width: number;
+		height: number;
+		update = vi.fn();
 
-		constructor(texture = { destroy: vi.fn() }) {
-			this.texture = texture;
+		constructor(options: { resource: unknown; width: number; height: number }) {
+			this.resource = options.resource;
+			this.width = options.width;
+			this.height = options.height;
 		}
-	},
-	Texture: {
-		from: vi.fn(() => ({ source: { update: vi.fn() }, destroy: vi.fn() })),
-	},
-}));
+	}
+
+	class MockTexture {
+		static from = vi.fn(() => ({ source: { update: vi.fn() }, destroy: vi.fn() }));
+		source: unknown;
+		destroy = vi.fn();
+
+		constructor(options: { source?: unknown } = {}) {
+			this.source = options.source ?? { update: vi.fn() };
+		}
+	}
+
+	return {
+		Application: class {},
+		BlurFilter: class {},
+		BufferImageSource: MockBufferImageSource,
+		Container: class {
+			visible = true;
+			addChild = vi.fn();
+			addChildAt = vi.fn();
+			removeChildren = vi.fn();
+		},
+		Graphics: class {},
+		Sprite: class {
+			visible = true;
+			x = 0;
+			y = 0;
+			alpha = 1;
+			scale = { x: 1, y: 1, set: vi.fn() };
+			anchor = { x: 0.5, y: 0.5, set: vi.fn() };
+			position = { set: vi.fn() };
+			texture: { destroy: ReturnType<typeof vi.fn> };
+
+			constructor(texture = { destroy: vi.fn() }) {
+				this.texture = texture;
+			}
+		},
+		Texture: MockTexture,
+	};
+});
 
 vi.mock("pixi-filters/motion-blur", () => ({
 	MotionBlurFilter: class {},
@@ -116,6 +140,7 @@ function createMockContext() {
 		clearRect: vi.fn(),
 		drawImage: vi.fn(),
 		fillRect: vi.fn(),
+		putImageData: vi.fn(),
 		save: vi.fn(),
 		restore: vi.fn(),
 		getImageData: vi.fn(() => ({ data: new Uint8ClampedArray(0) })),
@@ -342,7 +367,35 @@ describe("ModernFrameRenderer blur export path", () => {
 	});
 });
 
-describe("ModernFrameRenderer webcam frame cache", () => {
+describe("ModernFrameRenderer video frame staging", () => {
+	it("uses VideoFrame RGBA copyTo buffer uploads for Linux WebGL scene frames", async () => {
+		const renderer = createRenderer() as any;
+		const copyTo = vi.fn(async (target: Uint8Array) => {
+			target.set([255, 0, 0, 255, 0, 255, 0, 255]);
+		});
+		const frame = {
+			displayWidth: 2,
+			displayHeight: 1,
+			copyTo,
+			timestamp: 0,
+		} as unknown as VideoFrame;
+
+		renderer.rendererBackend = "webgl";
+
+		const result = await renderer.resolveDetachedVideoFrameSource(frame, "scene", 2, 1);
+
+		expect(result).toBe(renderer.sceneVideoFrameBufferStaging.source);
+		expect(copyTo).toHaveBeenCalledWith(expect.any(Uint8Array), {
+			format: "RGBA",
+			layout: [{ offset: 0, stride: 8 }],
+		});
+		expect(renderer.sceneVideoFrameBufferStaging.pixels).toEqual(
+			new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255]),
+		);
+		expect(renderer.sceneVideoFrameBufferStaging.source.update).toHaveBeenCalled();
+		expect(renderer.sceneVideoFrameStagingCanvas).toBeNull();
+	});
+
 	it("stages webcam video frames on WebGPU instead of using retained frame uploads", () => {
 		const renderer = createRenderer() as any;
 		renderer.rendererBackend = "webgpu";

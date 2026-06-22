@@ -23,12 +23,12 @@ export function getScreenSourceIdForDisplay({
 	matchedSourceId?: string | null;
 	platform: NodeJS.Platform | string;
 }) {
-	if (matchedSourceId) {
-		return matchedSourceId;
-	}
-
 	if (platform === "linux" && isLikelyLinuxWaylandSession(env)) {
 		return LINUX_PORTAL_SCREEN_SOURCE_ID;
+	}
+
+	if (matchedSourceId) {
+		return matchedSourceId;
 	}
 
 	return `screen:fallback:${displayId}`;

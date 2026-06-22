@@ -52,6 +52,7 @@ import {
 } from "@/lib/wallpapers";
 import { AudioProcessor, isAacAudioEncodingSupported } from "./audioEncoder";
 import {
+	getDefaultLightningRenderBackend,
 	normalizeLightningRuntimePlatform,
 	shouldPreferNativeAutoBackend,
 	shouldPreferNativeStaticLayoutBeforeBreeze,
@@ -312,6 +313,9 @@ export class ModernVideoExporter {
 	private encoder: VideoEncoder | null = null;
 	private muxer: VideoMuxer | null = null;
 	private audioProcessor: AudioProcessor | null = null;
+	private webCodecsEncodeStagingCanvas: HTMLCanvasElement | null = null;
+	private webCodecsEncodeStagingContext: CanvasRenderingContext2D | null = null;
+	private webCodecsEncodeReadbackWarningShown = false;
 	private cancelled = false;
 	private encodeQueue = 0;
 	private webCodecsEncodeQueueLimit = 0;
@@ -586,7 +590,8 @@ export class ModernVideoExporter {
 				this.renderer = new ModernFrameRenderer({
 					width: this.config.width,
 					height: this.config.height,
-					preferredRenderBackend: undefined,
+					preferredRenderBackend:
+						this.config.preferredRenderBackend ?? getDefaultLightningRenderBackend(),
 					wallpaper: this.config.wallpaper,
 					zoomRegions: this.config.zoomRegions,
 					showShadow: this.config.showShadow,
@@ -2726,7 +2731,7 @@ export class ModernVideoExporter {
 			if (this.cancelled) return;
 			if (this.nativeEncoderError) throw this.nativeEncoderError;
 		}
-		const canvas = this.renderer!.getCanvas();
+		const canvas = this.getWebCodecsEncodeCanvas();
 		const frame = new VideoFrame(canvas, {
 			timestamp,
 			duration: frameDuration,
@@ -2952,7 +2957,7 @@ export class ModernVideoExporter {
 		frameDuration: number,
 		frameIndex: number,
 	) {
-		const canvas = this.renderer!.getCanvas();
+		const canvas = this.getWebCodecsEncodeCanvas();
 
 		// @ts-expect-error - colorSpace not in TypeScript definitions but works at runtime
 		const exportFrame = new VideoFrame(canvas, {
@@ -3001,6 +3006,84 @@ export class ModernVideoExporter {
 		} finally {
 			exportFrame.close();
 		}
+	}
+
+	private getWebCodecsEncodeCanvas(): HTMLCanvasElement {
+		const canvas = this.renderer!.getCanvas();
+		if (this.getRuntimePlatform() !== "linux") {
+			return canvas;
+		}
+
+		const width = Math.max(1, Math.floor(this.config.width));
+		const height = Math.max(1, Math.floor(this.config.height));
+		const expectedByteLength = width * height * 4;
+
+		try {
+			const pixels = this.renderer!.capturePixelsForNativeExport();
+			if (!pixels || pixels.length < expectedByteLength || typeof ImageData === "undefined") {
+				this.warnWebCodecsEncodeReadbackFallback(
+					pixels
+						? `unexpected pixel buffer length ${pixels.length}; expected at least ${expectedByteLength}`
+						: "renderer did not provide a pixel buffer",
+				);
+				return canvas;
+			}
+
+			const staging = this.ensureWebCodecsEncodeStagingCanvas(width, height);
+			if (!staging) {
+				this.warnWebCodecsEncodeReadbackFallback("2D staging canvas unavailable");
+				return canvas;
+			}
+
+			const imageDataPixels = new Uint8ClampedArray(expectedByteLength);
+			imageDataPixels.set(pixels.subarray(0, expectedByteLength));
+			staging.context.putImageData(new ImageData(imageDataPixels, width, height), 0, 0);
+			return staging.canvas;
+		} catch (error) {
+			this.warnWebCodecsEncodeReadbackFallback(error);
+			return canvas;
+		}
+	}
+
+	private ensureWebCodecsEncodeStagingCanvas(
+		width: number,
+		height: number,
+	): { canvas: HTMLCanvasElement; context: CanvasRenderingContext2D } | null {
+		if (
+			this.webCodecsEncodeStagingCanvas &&
+			this.webCodecsEncodeStagingCanvas.width === width &&
+			this.webCodecsEncodeStagingCanvas.height === height &&
+			this.webCodecsEncodeStagingContext
+		) {
+			return {
+				canvas: this.webCodecsEncodeStagingCanvas,
+				context: this.webCodecsEncodeStagingContext,
+			};
+		}
+
+		const canvas = document.createElement("canvas");
+		canvas.width = width;
+		canvas.height = height;
+		const context = canvas.getContext("2d", { willReadFrequently: false });
+		if (!context) {
+			return null;
+		}
+
+		this.webCodecsEncodeStagingCanvas = canvas;
+		this.webCodecsEncodeStagingContext = context;
+		return { canvas, context };
+	}
+
+	private warnWebCodecsEncodeReadbackFallback(reason: unknown): void {
+		if (this.webCodecsEncodeReadbackWarningShown) {
+			return;
+		}
+
+		this.webCodecsEncodeReadbackWarningShown = true;
+		console.warn(
+			"[VideoExporter] Linux WebCodecs canvas readback staging unavailable; falling back to direct canvas encode.",
+			reason,
+		);
 	}
 
 	private reportFinalizingProgress(

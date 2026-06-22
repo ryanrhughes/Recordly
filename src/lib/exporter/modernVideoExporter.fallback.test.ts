@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => {
 		streamingDecoderGetDemuxer: vi.fn(() => null),
 		streamingDecoderGetEffectiveDuration: vi.fn(() => 0),
 		streamingDecoderLoadMetadata: vi.fn(async () => videoInfo),
+		frameRendererConstructArgs: [] as Array<Record<string, unknown>>,
 		frameRendererDestroy: vi.fn(),
 		frameRendererGetBackend: vi.fn(() => "webgl"),
 		frameRendererInitialize: vi.fn(async () => {}),
@@ -48,7 +49,8 @@ vi.mock("./streamingDecoder", () => ({
 }));
 
 vi.mock("./modernFrameRenderer", () => ({
-	FrameRenderer: vi.fn().mockImplementation(function () {
+	FrameRenderer: vi.fn().mockImplementation(function (config: Record<string, unknown>) {
+		mocks.frameRendererConstructArgs.push(config);
 		return {
 			destroy: mocks.frameRendererDestroy,
 			getRendererBackend: mocks.frameRendererGetBackend,
@@ -76,7 +78,56 @@ describe("ModernVideoExporter native fallback routing", () => {
 
 	afterEach(() => {
 		vi.clearAllMocks();
+		mocks.frameRendererConstructArgs.length = 0;
 		vi.unstubAllGlobals();
+	});
+
+	function createMinimalExporter(overrides: Record<string, unknown> = {}) {
+		return new ModernVideoExporter({
+			videoUrl: "file:///recording.mp4",
+			width: 1920,
+			height: 1080,
+			frameRate: 30,
+			bitrate: 8_000_000,
+			wallpaper: "#101010",
+			padding: 0,
+			borderRadius: 0,
+			backgroundBlur: 0,
+			shadowIntensity: 0,
+			showShadow: false,
+			cropRegion: { x: 0, y: 0, width: 1, height: 1 },
+			backendPreference: "webcodecs",
+			...overrides,
+		} as never) as unknown as {
+			export: () => Promise<{ success: boolean; blob?: Blob; error?: string }>;
+			initializeEncoder: () => Promise<unknown>;
+		};
+	}
+
+	async function exportWithMockEncoder(
+		exporter: ReturnType<typeof createMinimalExporter>,
+	): Promise<void> {
+		vi.spyOn(exporter, "initializeEncoder").mockResolvedValue({
+			codec: "avc1.640034",
+			hardwareAcceleration: "prefer-hardware",
+		});
+
+		const result = await exporter.export();
+		expect(result.success).toBe(true);
+	}
+
+	it("uses the stable WebGL renderer for Lightning exports by default", async () => {
+		await exportWithMockEncoder(createMinimalExporter());
+
+		expect(mocks.frameRendererConstructArgs).toHaveLength(1);
+		expect(mocks.frameRendererConstructArgs[0]?.preferredRenderBackend).toBe("webgl");
+	});
+
+	it("passes an explicit Lightning render backend through to the frame renderer", async () => {
+		await exportWithMockEncoder(createMinimalExporter({ preferredRenderBackend: "webgpu" }));
+
+		expect(mocks.frameRendererConstructArgs).toHaveLength(1);
+		expect(mocks.frameRendererConstructArgs[0]?.preferredRenderBackend).toBe("webgpu");
 	});
 
 	it("falls back to WebCodecs instead of surfacing a native error when Breeze is unavailable", async () => {
